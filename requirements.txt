@@ -1,0 +1,14 @@
+langchain
+langchain_community
+langchain_core
+sentence-transformers
+pypdf
+PyPDF2
+python-dotenv
+numpy
+ollama
+faiss-cpu
+pymupdf 
+torch
+streamlit
+pdfplumber

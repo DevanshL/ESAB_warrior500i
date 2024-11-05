@@ -1,0 +1,25 @@
+# Ignore Python cache and compiled files
+__pycache__/
+*.py[cod]
+
+# Ignore virtual environment folder
+env/
+
+# Ignore FAISS database directories
+faiss_dbs/
+
+# Ignore PDF files
+pdfs/*.pdf
+
+# Ignore log files
+*.log
+
+# Ignore Streamlit cache and artifacts
+.streamlit/
+
+# Ignore VS Code settings (optional)
+.vscode/
+
+# Ignore OS-specific files
+.DS_Store
+Thumbs.db
