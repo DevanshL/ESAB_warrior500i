@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 langchain
 langchain_community
 langchain_core
@@ -12,3 +13,16 @@ pymupdf
 torch
 streamlit
 pdfplumber
+=======
+langchain
+langchain_community
+langchain_core
+sentence-transformers
+pypdf
+PyPDF2
+python-dotenv
+numpy
+ollama
+faiss-cpu
+pymupdf 
+>>>>>>> ac2cad37fa9338de0369c29755612071a8a45d63
