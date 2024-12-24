@@ -1,367 +1,605 @@
-<<<<<<< HEAD
+## handles general queries also
+
 import os
 import base64
+import re
 import streamlit as st
-from fuzzywuzzy import process
-from langchain_community.document_loaders import PyPDFLoader
+import pdfplumber
+import glob
+import pandas as pd
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.chains import RetrievalQA
 from langchain_community.vectorstores import FAISS
-from langchain_community.llms import Ollama
+from langchain_community.llms import ollama
+from langchain_groq import ChatGroq
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from fuzzywuzzy import fuzz, process
 from langchain.memory import ConversationBufferMemory
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain.chains import create_retrieval_chain
+from langchain.docstore.document import Document
+from langchain.prompts import PromptTemplate
+import warnings
+import requests
+from dotenv import load_dotenv
+import logging
+import traceback
+from typing import Dict, List
 
-# Import prompt functions from each machine's specific prompt file
-from prompt_warrior_edge import get_prompt as get_warrior_edge_prompt
-from prompt_warrior_500i import get_prompt as get_warrior_500i_prompt
-from prompt_fabricator_em_400i_500i import get_prompt as get_fabricator_em_400i_500i_prompt
-from prompt_fabricator_et_410ip import get_prompt as get_fabricator_et_410ip_prompt
+# ---------------------- Setup Logging ----------------------
+logging.basicConfig(level=logging.INFO, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Define the list of ESAB machines with supported knowledge bases
-ESAB_MACHINES = ["Warrior-Edge", "Warrior 500i", "Fabricator EM 400i&500i", "Fabricator ET 410iP"]
+# ------------------- Load Environment Variables -------------------
+load_dotenv()
+warnings.filterwarnings("ignore")
 
-# Define the FAISS database directory
+# ------------------------ Configuration ------------------------
+AWS_IP = "15.207.109.112"  # Adjust as needed
+AWS_PORT = "11434"
+
+pdf_dir = 'pdfs'
 FAISS_DB_DIR = "faiss_dbs"
 os.makedirs(FAISS_DB_DIR, exist_ok=True)
 
-# Define greeting responses
+# Greeting responses
 GREETING_RESPONSES = ["hi", "hello", "hey", "hola", "howdy", "greetings"]
 
-@st.cache_resource
-def load_or_create_db(machine):
-    db_path = os.path.join(FAISS_DB_DIR, f"db_{machine.lower().replace(' ', '_')}")
-    
-    if os.path.exists(db_path):
-        print(f"Loading existing database for {machine}...")
-        return FAISS.load_local(db_path, HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2"), allow_dangerous_deserialization=True)
+# --------------------------------------------------------------------------------
+# Utility Functions to Convert DataFrame, Extract Sections, and Detect Processes
+# --------------------------------------------------------------------------------
+
+def dataframe_to_documents(df: pd.DataFrame) -> List[Document]:
+    """
+    Converts a DataFrame of welding processes and machines into
+    a list of string-based Documents for indexing and retrieval.
+    """
+    documents = []
+    for _, row in df.iterrows():
+        process = row["Welding Process"]
+        machines = row["Machines"]
+        content = f"The welding process {process} is compatible with the following machines: {machines}."
+        documents.append(Document(page_content=content))
+    return documents
+
+def extract_sections(pdf_paths: List[str], sections_to_extract: List[str]) -> Dict[str, Dict[str, str]]:
+    """
+    Extracts specified sections from the given PDF files.
+    Returns a nested dict: {machine_name: {section: "content", ...}, ...}
+    """
+    extracted_data = {}
+    # Patterns for the headers we care about
+    section_header_patterns = {
+        section: [
+            re.compile(rf'^\d+\.\s+{re.escape(section.upper())}$', re.IGNORECASE),
+            re.compile(rf'^[IVXLCDM]+\.\s+{re.escape(section.upper())}$', re.IGNORECASE),
+            re.compile(rf'^\d+\s+{re.escape(section.upper())}$', re.IGNORECASE),
+            re.compile(rf'^[IVXLCDM]+\s+{re.escape(section.upper())}$', re.IGNORECASE),
+            re.compile(rf'^{re.escape(section.upper())}$', re.IGNORECASE),
+            re.compile(rf'^\d+\.\s+{re.escape(section.upper())}[:\-]$', re.IGNORECASE),
+            re.compile(rf'^[IVXLCDM]+\.\s+{re.escape(section.upper())}[:\-]$', re.IGNORECASE),
+            re.compile(rf'^{re.escape(section.upper())}[:\-]$', re.IGNORECASE),
+        ]
+        for section in sections_to_extract
+    }
+    # Pattern for any new "unwanted" section header (stop capturing text if we hit a new one)
+    any_section_header_pattern = re.compile(r'^\d+\s+[A-Z\s\-]+$', re.IGNORECASE)
+
+    for pdf_path in pdf_paths:
+        machine_name = os.path.splitext(os.path.basename(pdf_path))[0]
+        extracted_data[machine_name] = {section: "" for section in sections_to_extract}
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                current_section = None
+                collected_text = {section: "" for section in sections_to_extract}
+
+                for page_number, page in enumerate(pdf.pages, start=1):
+                    page_text = page.extract_text() or ""
+                    lines = page_text.split('\n')
+
+                    for i, line in enumerate(lines):
+                        line_stripped = line.strip()
+                        line_upper = line_stripped.upper()
+
+                        # Check if line is a header for a desired section
+                        matched_section = None
+                        for section, patterns in section_header_patterns.items():
+                            for pattern in patterns:
+                                if pattern.match(line_stripped):
+                                    matched_section = section
+                                    break
+                            if matched_section:
+                                break
+
+                        if matched_section:
+                            current_section = matched_section
+                            # Collect the rest of the page after the matched header
+                            if i + 1 < len(lines):
+                                collected_text[current_section] += '\n'.join(lines[i+1:]) + '\n'
+                            break  # move to next page
+                        elif any_section_header_pattern.match(line_upper):
+                            # Found a new section not in sections_to_extract
+                            current_section = None
+                            continue
+
+                        # If we're inside a desired section, accumulate text
+                        if current_section:
+                            collected_text[current_section] += line + '\n'
+
+                # Final assignment of extracted text
+                for section in sections_to_extract:
+                    content = collected_text[section].strip()
+                    if content:
+                        extracted_data[machine_name][section] = content
+                    else:
+                        extracted_data[machine_name][section] = f"[INFO] No {section.upper()} section found."
+        except Exception as e:
+            logger.error(f"[ERROR] Processing {pdf_path}: {e}")
+
+    return extracted_data
+
+def detect_welding_processes(sections: Dict[str, Dict[str, str]]) -> pd.DataFrame:
+    """
+    Detects which machines support MMA, MIG/MAG, TIG, FCAW, etc.
+    Returns a DataFrame with 'Welding Process' and 'Compatible Machines'.
+    """
+    welding_processes = {
+        "MMA": ["MMA", "STICK", "SMAW"],
+        "MIG/MAG": ["MIG", "MAG", "GMAW"],
+        "TIG": ["TIG", "GTAW"],
+        "FCAW": ["FCAW", "FLUX CORED"]
+    }
+    process_machines = {proc: [] for proc in welding_processes.keys()}
+
+    for machine, content_dict in sections.items():
+        # Combine "INTRODUCTION" + "TECHNICAL DATA" text
+        combined_content = ""
+        for sec_name in ["INTRODUCTION", "TECHNICAL DATA"]:
+            sec_text = content_dict.get(sec_name, "")
+            combined_content += sec_text.upper() + " "
+
+        # Match processes
+        for process_name, keywords in welding_processes.items():
+            for kw in keywords:
+                pattern = r'\b' + re.escape(kw.upper()) + r'\b'
+                if re.search(pattern, combined_content):
+                    process_machines[process_name].append(machine)
+                    break
+
+    data = {"Welding Process": [], "Machines": []}
+    for process_name, machines_list in process_machines.items():
+        if machines_list:
+            data["Welding Process"].append(process_name)
+            data["Machines"].append(", ".join(machines_list))
+
+    df = pd.DataFrame(data)
+    df = df.sort_values("Welding Process").reset_index(drop=True)
+    return df
+
+# --------------------------------------------------------------------------------
+# Existing Streamlit App Code
+# --------------------------------------------------------------------------------
+
+# 1) Validate PDFs by searching for "dimensions" text
+def is_pdf_valid(pdf_path):
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text and "dimensions" in text.lower():
+                    return True
+        return False
+    except Exception as e:
+        logger.error(f"Error validating PDF {pdf_path}: {e}")
+        return False
+
+ESAB_MACHINES = []
+for manual_name in os.listdir(pdf_dir):
+    if manual_name.lower().endswith('.pdf'):
+        pdf_path = os.path.join(pdf_dir, manual_name)
+        machine_name = manual_name[:-4]
+        if is_pdf_valid(pdf_path):
+            ESAB_MACHINES.append(machine_name)
+        else:
+            logger.warning(f"PDF for '{machine_name}' is invalid or lacks 'dimensions' data. Skipping.")
+
+if not ESAB_MACHINES:
+    logger.error("No valid machine manuals found in the 'pdfs' directory.")
+    st.error("No valid machine manuals found. Please ensure that the PDF files are present and contain 'dimensions' text.")
+    st.stop()
+
+GROQ_API_KEY = os.getenv("GROQ_API")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API")
+
+def check_aws_connection():
+    """
+    Checks connection to AWS GPU server.
+    """
+    try:
+        response = requests.get(f"http://{AWS_IP}:{AWS_PORT}", timeout=5)
+        if response.status_code == 200:
+            st.sidebar.success("✅ Connected to AWS GPU server")
+            return True
+        else:
+            st.sidebar.error("❌ Connection to AWS GPU server failed")
+            return False
+    except requests.exceptions.RequestException:
+        st.sidebar.error("❌ Unable to connect to AWS GPU server")
+        return False
+
+def get_llm():
+    """
+    Initializes the LLM (Ollama on AWS or fallback to Groq).
+    """
+    if check_aws_connection():
+        return ollama.Ollama(
+            model="llama3",
+            temperature=0.05,
+            base_url=f"http://{AWS_IP}:{AWS_PORT}"
+        )
     else:
-        print(f"Creating new database for {machine}...")
-        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        pdf_path = f"pdfs/{machine}.pdf"
-        loader = PyPDFLoader(pdf_path)
-        docs = loader.load()
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=20)
-        documents = text_splitter.split_documents(docs)
-        db = FAISS.from_documents(documents, embeddings)
-        db.save_local(db_path)
-        print(f"Database for {machine} created and saved.")
+        st.sidebar.warning("⚠️ Using Groq model instead of AWS GPU server.")
+        return ChatGroq(
+            groq_api_key=GROQ_API_KEY,
+            model_name="llama3-8b-8192",
+            temperature=0.05
+        )
+
+manual_template = """
+Welcome to the ESAB Knowledge Base!
+We have troubleshooting manuals for various ESAB welding machines. These guides offer solutions for common issues, error codes, and maintenance tips to ensure optimal performance.
+
+For specific troubleshooting steps or corrective actions, simply enter your query with the machine name or a general question about ESAB machines.
+1) If you need help with a specific machine, mention the machine name in your query.
+2) If you need info about machines that support a specific welding process, ask "Which machines handle TIG?".
+3) Refresh the page if you want to asks questions generally about ESAB machines.
+"""
+
+def extract_all_content_as_documents(pdf_paths):
+    """
+    Convert each PDF's text + tables into Document objects for FAISS indexing.
+    """
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200
+    )
+    documents = []
+    for pdf_path in pdf_paths:
+        machine_name = os.path.splitext(os.path.basename(pdf_path))[0]
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_number, page in enumerate(pdf.pages, start=1):
+                page_text = page.extract_text() or ""
+                if page_text:
+                    split_texts = text_splitter.split_text(page_text)
+                    for idx, chunk in enumerate(split_texts):
+                        documents.append(Document(
+                            page_content=chunk,
+                            metadata={
+                                "machine": machine_name,
+                                "page": page_number,
+                                "chunk_idx": idx
+                            }
+                        ))
+                # Convert tables to CSV
+                tables = page.extract_tables()
+                if tables:
+                    for table_idx, table in enumerate(tables):
+                        if table and len(table) > 1:
+                            df = pd.DataFrame(table[1:], columns=table[0]).fillna("")
+                            table_csv = df.to_csv(index=False)
+                            documents.append(Document(
+                                page_content=table_csv,
+                                metadata={
+                                    "machine": machine_name,
+                                    "page": page_number,
+                                    "table_idx": table_idx
+                                }
+                            ))
+    return documents
+
+@st.cache_resource
+def load_or_create_faiss_db():
+    """
+    Builds or loads a local FAISS database of all PDF content + 
+    the welding process analysis + the machine list doc.
+    """
+    faiss_db_path = os.path.join(FAISS_DB_DIR, "combined_faiss_db")
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model="models/embedding-001",
+        google_api_key=GOOGLE_API_KEY
+    )
+
+    # If FAISS DB already exists, load it
+    if os.path.exists(faiss_db_path):
+        logger.info("Loading existing FAISS database...")
+        db = FAISS.load_local(faiss_db_path, embeddings, allow_dangerous_deserialization=True)
+        logger.info("FAISS database loaded successfully.")
         return db
 
-def get_prompt_template(machine):
-    if machine == "Warrior-Edge":
-        return get_warrior_edge_prompt()
-    elif machine == "Warrior 500i":
-        return get_warrior_500i_prompt()
-    elif machine == "Fabricator EM 400i&500i":
-        return get_fabricator_em_400i_500i_prompt()
-    elif machine == "Fabricator ET 410iP":
-        return get_fabricator_et_410ip_prompt()
+    # Otherwise create a new one
+    logger.info("Creating new FAISS database...")
+    pdf_paths = glob.glob(os.path.join(pdf_dir, "*.pdf"))
+    if not pdf_paths:
+        logger.error(f"No PDF files found in {pdf_dir} directory.")
+        st.error(f"No PDF files found in {pdf_dir} directory.")
+        return None
 
-def setup_chain(machine):
-    llm = Ollama(model="llama3.1", temperature=0.05)
-    prompt = get_prompt_template(machine)
-    
-    db = load_or_create_db(machine)
-    retriever = db.as_retriever()
-    document_chain = create_stuff_documents_chain(llm, prompt)
-    retrieval_chain = create_retrieval_chain(retriever, document_chain)
+    # 1) Extract base documents from PDFs
+    documents = extract_all_content_as_documents(pdf_paths)
+    logger.info(f"Extracted {len(documents)} documents from PDFs.")
 
-    return retrieval_chain, ConversationBufferMemory(return_messages=True, memory_key="chat_history")
+    # 2) Also create a doc listing all ESAB machines
+    all_machines_text = "ESAB Machines List:\n" + "\n".join(ESAB_MACHINES)
+    machine_list_doc = Document(
+        page_content=all_machines_text,
+        metadata={"source": "machine_list"}
+    )
+    documents.append(machine_list_doc)
+
+    # 3) Extract sections and detect welding processes
+    sections_to_extract = ["INTRODUCTION", "TECHNICAL DATA"]
+    extracted_sections = extract_sections(pdf_paths, sections_to_extract)
+    process_df = detect_welding_processes(extracted_sections)
+
+    if not process_df.empty:
+        # Convert that DataFrame into Document objects
+        process_documents = dataframe_to_documents(process_df)
+        # Add them to the list of documents
+        documents.extend(process_documents)
+        logger.info(f"Added {len(process_documents)} welding process documents to the knowledge base.")
+    else:
+        logger.info("No welding processes identified or no relevant sections found.")
+
+    # 4) Build the FAISS DB
+    db = FAISS.from_documents(documents, embeddings)
+    db.save_local(faiss_db_path)
+    logger.info(f"FAISS database created and saved to {faiss_db_path}.")
+    return db
+
+def detect_machine_in_query(query):
+    """
+    Attempt to detect specific machine names from the user's query.
+    """
+    query_lower = query.lower()
+    machine_names = {m.lower(): m for m in ESAB_MACHINES}
+    detected = []
+
+    # Exact match
+    for machine_key in machine_names:
+        pattern = re.compile(rf"\b{re.escape(machine_key)}\b", re.IGNORECASE)
+        if pattern.findall(query_lower):
+            detected.append(machine_names[machine_key])
+
+    if detected:
+        return list(set(detected))
+
+    # Fuzzy matching
+    for machine_key, machine_original in machine_names.items():
+        partial_score = fuzz.partial_ratio(machine_key, query_lower)
+        token_set_score = fuzz.token_set_ratio(machine_key, query_lower)
+        if max(partial_score, token_set_score) > 70:
+            detected.append(machine_original)
+
+    # Simple "plural" check
+    for machine_key, machine_original in machine_names.items():
+        if machine_original.endswith('i') and not machine_original.endswith('ii'):
+            plural = machine_original + 's'
+            if plural.lower() in query_lower:
+                detected.append(machine_original)
+
+    return list(set(detected))
+
+def setup_chain(detected_machines):
+    """
+    Sets up the RetrievalQA chain with a specialized prompt:
+      - If user mentions a machine, focus on that machine's docs
+      - Otherwise, use entire DB for general queries.
+    """
+    llm = get_llm()
+    prompt = PromptTemplate(
+        template="""
+You are an AI assistant for ESAB, knowledgeable about ESAB welding machines.
+
+Instructions:
+1. If the user specifies one or more machines, focus your answer on those machines' documents.
+2. If the user does not specify any machine, use the entire knowledge base (including the welding process table).
+3. Always ground your responses in the retrieved information—avoid speculations beyond what is in the knowledge base.
+4. If the user asks "Which machines handle TIG?", look up the relevant 'welding_process_analysis' doc.
+5. If the user asks "List out machines that you can answer," reference the 'machine_list' doc in the knowledge base.
+6. **If you cannot find any relevant information to answer the question, respond generally with LLM MODEL." Do not include any instructions, related answers, or template steps in your response.**
+
+
+Context: {context}
+Question: {question}
+
+Provide an accurate and concise answer, referencing only the knowledge you have retrieved.
+Promote ESAB products and services where appropriate.
+""",
+        input_variables=["context", "question"]
+    )
+
+    db = load_or_create_faiss_db()
+
+    # If user specified machines, filter docs
+    if detected_machines:
+        relevant_docs = []
+        for doc_id, doc in db.docstore._dict.items():
+            # If doc's 'machine' metadata is in the detected_machines list
+            # or doc is a "welding_process_analysis" or "machine_list" doc, we can keep it
+            machine_meta = doc.metadata.get("machine", "").lower()
+            source_meta = doc.metadata.get("source", "")
+            if machine_meta in [m.lower() for m in detected_machines]:
+                relevant_docs.append(doc)
+            elif source_meta in ("welding_process_analysis", "machine_list"):
+                relevant_docs.append(doc)
+        if relevant_docs:
+            # Make a smaller FAISS with those docs
+            new_db = FAISS.from_documents(relevant_docs, db.embedding_function)
+            retriever = new_db.as_retriever(search_type="similarity", search_kwargs={"k": 13})
+            logger.info(f"Using filtered FAISS DB for {detected_machines} + analysis docs.")
+        else:
+            # Fallback: no matching docs => use entire DB
+            retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 13})
+            logger.warning("No matching docs for that machine. Using full DB.")
+    else:
+        # No machine => entire DB
+        retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 13})
+        logger.info("No specific machine. Using entire knowledge base.")
+
+    # Build the QA chain
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=retriever,
+        return_source_documents=True,
+        chain_type_kwargs={"prompt": prompt}
+    )
+
+    memory = ConversationBufferMemory(return_messages=True, memory_key="chat_history")
+    return qa_chain, memory
+
+def process_query(user_query, detected_machines):
+    """
+    Processes the user query with the chain. 
+    """
+    try:
+        if not detected_machines and st.session_state.current_machines:
+            # Re-use any existing context if user had previously set machines
+            detected_machines = st.session_state.current_machines
+
+        qa_chain, memory = setup_chain(detected_machines)
+        response = qa_chain.invoke({"query": user_query})
+
+        # Keep chat memory for multi-turn
+        memory.chat_memory.add_user_message(user_query)
+        memory.chat_memory.add_ai_message(response["result"])
+
+        return response
+    except Exception as e:
+        logger.error(f"Error processing query: {e}")
+        logger.error(traceback.format_exc())
+        return {"error": "Unable to process the query at the moment."}
 
 @st.cache_data
 def load_esab_logo():
+    """
+    Loads and base64-encodes an ESAB logo (if you have esab-logo.png).
+    """
     with open("esab-logo.png", "rb") as f:
         return base64.b64encode(f.read()).decode()
-    
-st.set_page_config(page_title="ESAB Machine Bot", layout="wide")
 
-# Initialize session state variables
+# ---------------------- Streamlit State Initialization ----------------------
 if 'machine_chat_history' not in st.session_state:
     st.session_state.machine_chat_history = {}
+if 'current_machines' not in st.session_state:
+    st.session_state.current_machines = []
+if 'retrieval_chain' not in st.session_state or 'memory' not in st.session_state:
+    st.session_state.retrieval_chain, st.session_state.memory = None, None
 
-if 'current_machine' not in st.session_state:
-    st.session_state.current_machine = None
+# ---------------------- Sidebar Configuration ----------------------
+st.sidebar.header("ESAB Machine Manuals")
+st.sidebar.markdown(manual_template)
+st.sidebar.subheader("Available Manuals")
+for m in ESAB_MACHINES:
+    st.sidebar.write(f"* {m}")
 
-if 'retrieval_chain' not in st.session_state:
-    st.session_state.retrieval_chain = None
+# Display ESAB Logo if exists
+if os.path.exists("esab-logo.png"):
+    logo = load_esab_logo()
+    st.markdown(
+        f"""
+        <div style="display: flex; align-items: center;">
+            <img src="data:image/png;base64,{logo}" 
+                 style="width:50px; height:50px; margin-right:10px;">
+            <h1 style="margin: 0;">ESAB AI Assistant</h1>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+else:
+    st.title("🔍 ESAB Welding Machines Knowledge Base")
 
-logo = load_esab_logo()
-st.markdown(
-    f"""
-    <div style="display: flex; align-items: center;">
-        <img src="data:image/png;base64,{logo}" style="width:50px; height:50px; border-radius:50%; margin-right:10px;">
-        <h1 style="margin: 0;">ESAB AI Assistant</h1>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+# ---------------------- Display Existing Conversation (If Any) ----------------------
+if st.session_state.current_machines:
+    key = "-".join(st.session_state.current_machines)
+    for msg in st.session_state.machine_chat_history.get(key, []):
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
-# Display selectbox for machine selection
-selected_machine = st.selectbox("Select an ESAB machine:", ESAB_MACHINES)
-if st.session_state.current_machine != selected_machine:
-    st.session_state.current_machine = selected_machine
-    st.session_state.retrieval_chain, _ = setup_chain(selected_machine)
-    st.session_state.machine_chat_history[selected_machine] = []  # Initialize chat history for the selected machine
+# ---------------------- Chat Interface ----------------------
+if prompt := st.chat_input("Ask a question about ESAB or specific machines..."):
+    detected_machines = detect_machine_in_query(prompt)
 
-if st.session_state.current_machine:
-    st.info(f"🔍 Current knowledge base: {st.session_state.current_machine}")
-
-# Display chat history
-if st.session_state.current_machine:
-    for message in st.session_state.machine_chat_history[st.session_state.current_machine]:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-# Handle new user query input
-if prompt := st.chat_input("Ask a question about ESAB or a specific machine"):
-    # Check if input is a greeting
+    # Handle simple greetings
     if prompt.lower() in GREETING_RESPONSES:
-        greeting_response = ("Hello, how may I assist you? If your query is regarding ESAB machines, "
-                             "please select one from the dropdown above to start your query.")
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        with st.chat_message("assistant"):
-            st.markdown(greeting_response)
-        st.session_state.machine_chat_history.setdefault('general', []).append({"role": "assistant", "content": greeting_response})
+        st.chat_message("assistant").markdown("Hello, how may I assist you today?")
+        st.session_state.machine_chat_history.setdefault('general', []).append({
+            "role": "assistant", 
+            "content": "Hello, how may I assist you today?"
+        })
+        st.stop()
+
+    # If new machines are detected, or chain isn't set, build a new chain
+    if detected_machines:
+        # Compare sets to see if we need a fresh context
+        if (not st.session_state.retrieval_chain 
+            or set(detected_machines) != set(st.session_state.current_machines)):
+            st.session_state.current_machines = detected_machines
+            st.session_state.retrieval_chain, st.session_state.memory = setup_chain(detected_machines)
+            key = "-".join(detected_machines)
+            st.session_state.machine_chat_history[key] = st.session_state.machine_chat_history.get(key, [])
+            st.info(f"🔍 Context set for: {', '.join(detected_machines)}")
     else:
-        # If it's not a greeting, process it normally
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        st.session_state.machine_chat_history[st.session_state.current_machine].append({"role": "user", "content": prompt})
-
-        # Generate response based on selected machine
-        with st.chat_message("assistant"):
-            with st.status("Thinking...", expanded=True) as status:
-                response = st.session_state.retrieval_chain.invoke({
-                    "input": prompt,
-                    "machine": st.session_state.current_machine,
-                    "chat_history": st.session_state.machine_chat_history[st.session_state.current_machine]
-                })
-                answer = response['answer']
-                status.update(label="Response ready!", state="complete", expanded=False)
-            st.markdown(answer)
-            st.session_state.machine_chat_history[st.session_state.current_machine].append({"role": "assistant", "content": answer})
-=======
-import os
-import streamlit as st
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.document_loaders import PyMuPDFLoader
-from langchain_community.vectorstores import FAISS
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains import RetrievalQA
-from langchain_community.llms import Ollama
-from langchain_core.prompts import PromptTemplate
-from langchain.schema import Document
-import pdfplumber
-import textwrap
-import warnings
-
-warnings.filterwarnings("ignore")
-
-llm = Ollama(model='llama3.1', temperature=0.05)
-
-# Initialize chat history in session state
-if 'chat_history' not in st.session_state:
-    st.session_state['chat_history'] = []
-
-if 'greeting_given' not in st.session_state:
-    st.session_state['greeting_given'] = False
-
-# Improved function to extract text and tables from PDF
-def extract_text_and_tables_from_pdf(file_path):
-    text_content = []
-    table_content = []
-
-    with pdfplumber.open(file_path) as pdf:
-        for page in pdf.pages:
-            # Extract page text
-            text = page.extract_text()
-            if text:
-                text_content.append(text)
-
-            # Extract tables
-            tables = page.extract_tables()
-            for table in tables:
-                if table:
-                    # Clean and verify table data
-                    cleaned_table = [["" if cell is None else str(cell) for cell in row] for row in table]
-                    formatted_table = "\n".join(["\t".join(row) for row in cleaned_table if any(row)])
-                    table_content.append(formatted_table)
-
-    combined_text = "\n\n".join(text_content)
-    combined_tables = "\n\n".join(table_content)
-
-    return combined_text, combined_tables
-
-# Function to split documents
-def split_docs(docs, chunk_size=1000, chunk_overlap=20):
-    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    chunks = splitter.split_documents(documents=docs)
-    return chunks
-
-# Embedding model loader
-def load_embedding_model(model_path, normalize_embedding=True):
-    return HuggingFaceEmbeddings(
-        model_name=model_path,
-        model_kwargs={'device': 'cpu'},
-        encode_kwargs={'normalize_embeddings': normalize_embedding}
-    )
-
-# Create embeddings
-def create_embeddings(chunks, embedding_model, storing_path='vectorstore'):
-    vectorstore = FAISS.from_documents(chunks, embedding_model)
-    vectorstore.save_local(storing_path)
-    return vectorstore
-
-# Updated prompt template
-template = '''
-    You are a technical assistant specialized in handling welding equipment, specifically the Warrior 500i CC/CV. 
-    You provide precise and accurate responses based on the manual, focusing on technical data. 
-    When responding to user queries, follow these instructions:
-    
-    - If the user asks about **safety**, make sure to include any relevant standards like ANSI/ASC Standard Z49.1.
-    - If the user asks for a **full section or Table of Contents**, provide the complete content without omissions.
-    - For longer content, make sure the response is split clearly into sub-sections for readability.
-    - If the user asks for a **list of types, examples, or uses**, provide them in a bullet-point format.
-    - If the user asks for **specific details or explanations**, provide them in a structured paragraph and some bullet points format.
-    - If the user requests a **step-by-step guide**, break down the information into numbered steps.
-    - If the user asks for **troubleshooting or errors**, list the errors and their corresponding solutions clearly, making sure not to skip any points.
-    - When providing **key points** for a query response provide as bullet points.
-    - For **comparisons**, ensure to highlight the differences and similarities clearly.
-    
-    Always ensure that the response is clear, concise, and contextual. Use the previous chat responses to maintain relevance but avoid unnecessary repetition.
-    
-    "{context}"
-
-    "### User:"
-    "{question}"
-
-    ### Response:
-'''
-
-# Function to format responses
-def format_response(response_text, user_query):
-    # Keywords for different formats
-    list_keywords = ['list', 'types', 'examples', 'uses', 'features', 'characteristics', 'mention', 'provide']
-    step_keywords = ['steps', 'how to', 'process', 'procedure', 'guide']
-    error_keywords = ['error', 'troubleshooting', 'fault']
-
-    # Check if the question indicates a list or step-by-step format
-    if any(keyword in user_query.lower() for keyword in list_keywords):
-        response_lines = response_text.split('\n')
-        formatted_response = "\n\n".join([f"- {line.strip()}" for line in response_lines if line.strip()])
-
-    elif any(keyword in user_query.lower() for keyword in step_keywords):
-        # Format response as numbered steps
-        response_lines = response_text.split('\n')
-        formatted_response = "\n\n".join([f"{idx + 1}. {line.strip().lstrip('1234567890. ')}" for idx, line in enumerate(response_lines) if line.strip()])
-
-    elif any(keyword in user_query.lower() for keyword in error_keywords):
-        # Specific format for errors in a troubleshooting context
-        response_lines = response_text.split('\n')
-        formatted_response = "\n\n".join([f"**{line.strip()}**" if "Error" in line else f"  - {line.strip()}" for line in response_lines if line.strip()])
-
-    else:
-        # Default to paragraph format for detailed explanations
-        formatted_response = textwrap.fill(response_text, width=6000)
-
-    return formatted_response
-
-# QA Chain Loader
-def load_qa_chain(retriever, llm, prompt):
-    return RetrievalQA.from_chain_type(
-        llm=llm,
-        retriever=retriever,
-        chain_type='stuff',
-        return_source_documents=True,
-        chain_type_kwargs={'prompt': prompt}
-    )
-
-# Load embedding model
-embed = load_embedding_model(model_path="sentence-transformers/all-MiniLM-L6-v2")
-
-# Load PDF and extract data
-file_path = "Warrior 500i.pdf"
-text_data, table_data = extract_text_and_tables_from_pdf(file_path)
-
-# Combine content into Document structure
-combined_content = [Document(page_content=text_data, metadata={'source': 'Text Data'}), Document(page_content=table_data, metadata={'source': 'Table Data'})]
-
-# Split documents into chunks
-documents = split_docs(combined_content)
-
-# Create embeddings and vector store
-vectorstore = create_embeddings(documents, embed)
-retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 3})
-
-# Create prompt
-prompt = PromptTemplate.from_template(template)
-chain = load_qa_chain(retriever, llm, prompt)
-
-# Chat history management
-def get_chat_history():
-    chat_history_str = ""
-    for chat in st.session_state['chat_history']:
-        chat_history_str += f"User: {chat['user']}\nBot: {chat['bot']}\n"
-    return chat_history_str.strip()
-
-# Function to add chat bubbles with custom styles
-def add_chat_bubble(role, text):
-    if role == 'user':
-        # User's message style
-        st.markdown(
-            f"""
-            <div style='background-color: #f0f0f0; border-radius: 15px; padding: 10px; margin-bottom: 10px; width: fit-content; max-width: 70%; margin-left: auto;'>
-                <strong style='color: #e74c3c;'>🧑</strong>
-                <span style='margin-left: 10px;'>{text}</span>
-            </div>
-            """, 
-            unsafe_allow_html=True
-        )
-    elif role == 'bot':
-        # Bot's message style
-        st.markdown(
-            f"""
-            <div style='background-color: #e8f8e8; border-radius: 15px; padding: 10px; margin-bottom: 10px; width: fit-content; max-width: 70%;'>
-                <strong style='color: #3498db;'>🤖</strong>
-                <span style='margin-left: 10px;'>{text}</span>
-            </div>
-            """, 
-            unsafe_allow_html=True
-        )
-
-# Streamlit UI setup
-st.title("Warrior 500i Chatbot")
-
-user_input = st.text_input("Ask a question about Warrior 500i equipment")
-
-greetings = ['hi', 'hello', 'hey', 'hola', 'howdy', 'greetings']
-
-if user_input:
-    try:
-        if any(greet in user_input.lower() for greet in greetings) and len(user_input.split()) <= 3 and not st.session_state['greeting_given']:
-            bot_response = "Hello! How may I assist you today?"
-            st.session_state['greeting_given'] = True
+        # If no machine is detected => general context
+        if not st.session_state.current_machines:
+            st.session_state.current_machines = []
+            st.session_state.retrieval_chain, st.session_state.memory = setup_chain([])
+            key = "general"
+            st.session_state.machine_chat_history[key] = st.session_state.machine_chat_history.get(key, [])
+            st.info("🔍 Using entire knowledge base for general queries.")
         else:
-            # Build up chat history to pass as context
-            chat_history = get_chat_history()
-            context = chat_history + f"\n\n### New Query:\nUser: {user_input}\nBot:"
+            st.info(f"🔍 Continuing context for: {', '.join(st.session_state.current_machines)}")
 
-            # Get the response from the LLM with context
-            response = chain({'query': user_input, 'context': context})
-            formatted_response = format_response(response['result'], user_input)
-            bot_response = formatted_response
+    # Ensure chain is ready
+    if not st.session_state.retrieval_chain:
+        st.session_state.retrieval_chain, st.session_state.memory = setup_chain(st.session_state.current_machines)
 
-        # Update the chat history with the current interaction
-        st.session_state['chat_history'].append({'user': user_input, 'bot': bot_response})
+    # Show the user's message
+    key = "-".join(st.session_state.current_machines) if st.session_state.current_machines else "general"
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    st.session_state.machine_chat_history.setdefault(key, []).append({
+        "role": "user",
+        "content": prompt
+    })
 
-    except Exception as e:
-        st.error(f"An error occurred: {e}")
-
-# Display chat history with chat bubbles
-if st.session_state['chat_history']:
-    for chat in st.session_state['chat_history']:
-        add_chat_bubble('user', chat['user'])
-        add_chat_bubble('bot', chat['bot'])
->>>>>>> ac2cad37fa9338de0369c29755612071a8a45d63
+    # Generate the AI response
+    with st.chat_message("assistant"):
+        try:
+            response = process_query(prompt, detected_machines)
+            if "error" in response:
+                st.markdown(response["error"])
+                st.session_state.machine_chat_history[key].append({
+                    "role": "assistant",
+                    "content": response["error"]
+                })
+            else:
+                st.markdown(response["result"])
+                st.session_state.machine_chat_history[key].append({
+                    "role": "assistant",
+                    "content": response["result"]
+                })
+                # Update memory
+                if st.session_state.memory:
+                    st.session_state.memory.save_context(
+                        {"input": prompt}, 
+                        {"output": response["result"]}
+                    )
+        except Exception as e:
+            err_msg = f"An error occurred: {str(e)}"
+            logger.error(f"Error generating response: {traceback.format_exc()}")
+            st.error(err_msg)
+            st.session_state.machine_chat_history[key].append({
+                "role": "assistant", 
+                "content": err_msg
+            })
